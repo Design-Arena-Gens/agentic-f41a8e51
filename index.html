@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Dirt Rally - Single File</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #0b0d10; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    #app { position: fixed; inset: 0; }
+    #hud { position: fixed; top: 12px; left: 12px; color: #e6e6e6; background: rgba(0,0,0,0.35); padding: 10px 12px; border-radius: 8px; user-select: none; pointer-events: none; line-height: 1.35; }
+    #hud h1 { margin: 0 0 6px 0; font-size: 14px; letter-spacing: 1px; text-transform: uppercase; color: #f0f0f0; }
+    #hud p { margin: 2px 0; font-size: 12px; opacity: 0.9; }
+    #perf { position: fixed; bottom: 12px; left: 12px; color: #cfd8dc; background: rgba(0,0,0,0.35); padding: 6px 8px; border-radius: 8px; font-size: 12px; user-select: none; }
+    .badge { display: inline-block; background: #242c33; color: #cfe1ff; border: 1px solid #3a4652; padding: 1px 6px; border-radius: 999px; font-size: 11px; margin-left: 6px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">
+    <h1>Dirt Rally <span class="badge">Single File</span></h1>
+    <p>Drive: W/S, Steer: A/D, Handbrake: Space</p>
+    <p>Reset: R, Toggle Trees: T, Toggle Rocks: Y</p>
+  </div>
+  <div id="perf">fps: -- | bodies: --</div>
+
+  <!-- Three.js and cannon-es via CDN (ESM) -->
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+    // Cannon-es ESM
+    import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
+
+    // 2D Simplex Noise (lightweight) - based on public domain code by Stefan Gustavson
+    class SimplexNoise2D {
+      constructor(seed = 1) {
+        // Xorshift RNG
+        let s = seed >>> 0;
+        const rand = () => (s = (s ^ (s << 13)) >>> 0, s = (s ^ (s >>> 17)) >>> 0, s = (s ^ (s << 5)) >>> 0, (s >>> 0) / 4294967296);
+        this.p = new Uint8Array(256);
+        for (let i = 0; i < 256; i++) this.p[i] = i;
+        for (let i = 255; i > 0; i--) { const j = (rand() * (i + 1)) | 0; [this.p[i], this.p[j]] = [this.p[j], this.p[i]]; }
+        this.perm = new Uint8Array(512);
+        for (let i = 0; i < 512; i++) this.perm[i] = this.p[i & 255];
+        this.grad2 = new Float32Array([
+          1,1,  -1,1,  1,-1,  -1,-1,
+          1,0,  -1,0,  1,0,   -1,0,
+          0,1,   0,-1, 0,1,    0,-1
+        ]);
+      }
+      noise2D(xin, yin) {
+        const F2 = 0.5 * (Math.sqrt(3) - 1);
+        const G2 = (3 - Math.sqrt(3)) / 6;
+        let n0 = 0, n1 = 0, n2 = 0;
+        const s = (xin + yin) * F2;
+        const i = Math.floor(xin + s);
+        const j = Math.floor(yin + s);
+        const t = (i + j) * G2;
+        const X0 = i - t;
+        const Y0 = j - t;
+        const x0 = xin - X0;
+        const y0 = yin - Y0;
+        let i1 = 0, j1 = 0;
+        if (x0 > y0) { i1 = 1; j1 = 0; } else { i1 = 0; j1 = 1; }
+        const x1 = x0 - i1 + G2;
+        const y1 = y0 - j1 + G2;
+        const x2 = x0 - 1 + 2 * G2;
+        const y2 = y0 - 1 + 2 * G2;
+        const ii = i & 255; const jj = j & 255;
+        const gi0 = (this.perm[ii + this.perm[jj]] % 12) * 2;
+        const gi1 = (this.perm[ii + i1 + this.perm[jj + j1]] % 12) * 2;
+        const gi2 = (this.perm[ii + 1 + this.perm[jj + 1]] % 12) * 2;
+        let t0 = 0.5 - x0*x0 - y0*y0; if (t0 < 0) n0 = 0; else { t0 *= t0; n0 = t0 * t0 * (this.grad2[gi0] * x0 + this.grad2[gi0+1] * y0); }
+        let t1 = 0.5 - x1*x1 - y1*y1; if (t1 < 0) n1 = 0; else { t1 *= t1; n1 = t1 * t1 * (this.grad2[gi1] * x1 + this.grad2[gi1+1] * y1); }
+        let t2 = 0.5 - x2*x2 - y2*y2; if (t2 < 0) n2 = 0; else { t2 *= t2; n2 = t2 * t2 * (this.grad2[gi2] * x2 + this.grad2[gi2+1] * y2); }
+        return 70 * (n0 + n1 + n2);
+      }
+    }
+
+    const appEl = document.getElementById('app');
+    const perfEl = document.getElementById('perf');
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: false, stencil: false, depth: true, powerPreference: 'high-performance' });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setClearColor(0x88a1b2, 1);
+    appEl.appendChild(renderer.domElement);
+
+    // Scene & Camera
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x88a1b2, 60, 450);
+    const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 1500);
+    camera.position.set(0, 5, 12);
+
+    // Lights
+    const hemi = new THREE.HemisphereLight(0xbfd1e5, 0x4b4d3b, 0.65);
+    scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(60, 120, -40);
+    scene.add(dir);
+
+    // Physics world
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+    world.defaultContactMaterial.friction = 0.9;
+    world.defaultContactMaterial.restitution = 0.0;
+
+    // Materials
+    const groundMaterial = new CANNON.Material('ground');
+    const wheelMaterial = new CANNON.Material('wheel');
+    world.addContactMaterial(new CANNON.ContactMaterial(groundMaterial, wheelMaterial, { friction: 1.6, restitution: 0.0, contactEquationStiffness: 1e7, contactEquationRelaxation: 3 }));
+
+    // Terrain generation
+    const TERRAIN_SIZE = 800; // meters
+    const RES = 128; // grid resolution per side (RES+1 points)
+    const ELEMENT_SIZE = TERRAIN_SIZE / RES;
+    const noise = new SimplexNoise2D(1337);
+    const heightData = [];
+    const heightScale = 22;
+
+    const octave = (x, y, freq, amp) => noise.noise2D(x*freq, y*freq) * amp;
+    for (let j = 0; j <= RES; j++) {
+      const row = [];
+      for (let i = 0; i <= RES; i++) {
+        const nx = i / RES - 0.5;
+        const ny = j / RES - 0.5;
+        let h = 0;
+        h += octave(nx, ny, 1.2, 0.6);
+        h += octave(nx, ny, 3.1, 0.25);
+        h += octave(nx, ny, 7.7, 0.12);
+        h += octave(nx, ny, 15.5, 0.06);
+        // Carve a rough track loop (lower heights)
+        const r = Math.hypot(nx*1.2, ny*1.0);
+        const ring = Math.exp(-Math.pow((r-0.28)/0.07, 2)) * 0.9;
+        h -= ring;
+        row.push(h * heightScale);
+      }
+      heightData.push(row);
+    }
+
+    // THREE terrain mesh with vertex colors based on slope/height
+    const terrainGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, RES, RES);
+    terrainGeo.rotateX(-Math.PI/2);
+    const pos = terrainGeo.attributes.position;
+    const colors = new Float32Array(pos.count * 3);
+    for (let j = 0; j <= RES; j++) {
+      for (let i = 0; i <= RES; i++) {
+        const idx = j*(RES+1) + i;
+        const y = heightData[j][i];
+        pos.setY(idx, y);
+      }
+    }
+    pos.needsUpdate = true;
+    terrainGeo.computeVertexNormals();
+
+    // Color by slope and height
+    const normal = new THREE.Vector3();
+    for (let idx = 0; idx < pos.count; idx++) {
+      normal.fromBufferAttribute(terrainGeo.attributes.normal, idx);
+      const upDot = normal.y; // 0..1
+      const v = pos.getY(idx);
+      const heightNorm = THREE.MathUtils.clamp((v + heightScale) / (heightScale*2), 0, 1);
+      // Dirt base
+      let r = 0.38, g = 0.31, b = 0.25;
+      // Add greenish tint on flatter areas
+      const grassFactor = Math.pow(THREE.MathUtils.clamp(upDot, 0, 1), 1.5) * 0.45 * (0.6 + 0.4*heightNorm);
+      r = THREE.MathUtils.lerp(r, 0.27, grassFactor);
+      g = THREE.MathUtils.lerp(g, 0.38, grassFactor);
+      b = THREE.MathUtils.lerp(b, 0.23, grassFactor);
+      // Rocky tint on steep slopes
+      const rockFactor = THREE.MathUtils.clamp(1.0 - upDot, 0, 1) * 0.7;
+      r = THREE.MathUtils.lerp(r, 0.45, rockFactor);
+      g = THREE.MathUtils.lerp(g, 0.44, rockFactor);
+      b = THREE.MathUtils.lerp(b, 0.46, rockFactor);
+      colors[idx*3+0] = r; colors[idx*3+1] = g; colors[idx*3+2] = b;
+    }
+    terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1.0, metalness: 0.0, flatShading: false });
+    const terrainMesh = new THREE.Mesh(terrainGeo, terrainMat);
+    terrainMesh.receiveShadow = false;
+    scene.add(terrainMesh);
+
+    // CANNON Heightfield
+    const hfShape = new CANNON.Heightfield(heightData, { elementSize: ELEMENT_SIZE });
+    const hfBody = new CANNON.Body({ mass: 0, material: groundMaterial });
+    hfBody.addShape(hfShape);
+    hfBody.quaternion.setFromEuler(-Math.PI/2, 0, 0, 'XYZ');
+    hfBody.position.set(-TERRAIN_SIZE/2, 0, TERRAIN_SIZE/2);
+    world.addBody(hfBody);
+
+    // Rock instances (with some physics obstacles)
+    const rocksGroup = new THREE.Group();
+    scene.add(rocksGroup);
+    const rockGeom = new THREE.DodecahedronGeometry(1.0, 0);
+    const rockMat = new THREE.MeshStandardMaterial({ color: 0x7a6d64, roughness: 1, metalness: 0 });
+    const ROCK_COUNT = 120;
+    const rockInst = new THREE.InstancedMesh(rockGeom, rockMat, ROCK_COUNT);
+    rockInst.castShadow = false; rockInst.receiveShadow = false;
+    rocksGroup.add(rockInst);
+    const tmpObj = new THREE.Object3D();
+    const rockBodies = [];
+    for (let i = 0; i < ROCK_COUNT; i++) {
+      const rx = (Math.random()-0.5) * (TERRAIN_SIZE*0.9);
+      const rz = (Math.random()-0.5) * (TERRAIN_SIZE*0.9);
+      const hi = Math.round((rx + TERRAIN_SIZE/2) / ELEMENT_SIZE);
+      const hj = Math.round((-rz + TERRAIN_SIZE/2) / ELEMENT_SIZE);
+      if (hi < 0 || hi > RES || hj < 0 || hj > RES) continue;
+      const ry = heightData[hj][hi] + 0.3;
+      const s = 0.6 + Math.random()*1.3;
+      tmpObj.position.set(rx, ry, rz);
+      tmpObj.rotation.set(0, Math.random()*Math.PI*2, 0);
+      tmpObj.scale.setScalar(s);
+      tmpObj.updateMatrix();
+      rockInst.setMatrixAt(i, tmpObj.matrix);
+      // Physics body for some rocks (sparse for performance)
+      if (Math.random() < 0.2) {
+        const sphere = new CANNON.Sphere(s*0.75);
+        const body = new CANNON.Body({ mass: 0, shape: sphere, position: new CANNON.Vec3(rx, ry, rz), material: groundMaterial });
+        world.addBody(body);
+        rockBodies.push(body);
+      }
+    }
+    rockInst.instanceMatrix.needsUpdate = true;
+
+    // Trees (instanced, no physics for performance)
+    const treesGroup = new THREE.Group();
+    scene.add(treesGroup);
+    const trunkGeom = new THREE.CylinderGeometry(0.12, 0.18, 2.0, 6);
+    const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5a4636, roughness: 1 });
+    const leavesGeom = new THREE.ConeGeometry(1.2, 2.6, 8);
+    const leavesMat = new THREE.MeshStandardMaterial({ color: 0x2f6b3c, roughness: 0.9 });
+    const TREE_COUNT = 350;
+    const trunkInst = new THREE.InstancedMesh(trunkGeom, trunkMat, TREE_COUNT);
+    const leavesInst = new THREE.InstancedMesh(leavesGeom, leavesMat, TREE_COUNT);
+    treesGroup.add(trunkInst); treesGroup.add(leavesInst);
+    for (let i = 0; i < TREE_COUNT; i++) {
+      const rx = (Math.random()-0.5) * (TERRAIN_SIZE*0.95);
+      const rz = (Math.random()-0.5) * (TERRAIN_SIZE*0.95);
+      const hi = Math.round((rx + TERRAIN_SIZE/2) / ELEMENT_SIZE);
+      const hj = Math.round((-rz + TERRAIN_SIZE/2) / ELEMENT_SIZE);
+      if (hi < 0 || hi > RES || hj < 0 || hj > RES) continue;
+      const y = heightData[hj][hi];
+      const s = 0.8 + Math.random()*0.8;
+      tmpObj.position.set(rx, y + 1.0, rz);
+      tmpObj.rotation.set(0, Math.random()*Math.PI*2, 0);
+      tmpObj.scale.set(1, 1, 1);
+      tmpObj.updateMatrix();
+      trunkInst.setMatrixAt(i, tmpObj.matrix);
+      tmpObj.position.set(rx, y + 2.4, rz);
+      tmpObj.scale.setScalar(s);
+      tmpObj.updateMatrix();
+      leavesInst.setMatrixAt(i, tmpObj.matrix);
+    }
+    trunkInst.instanceMatrix.needsUpdate = true;
+    leavesInst.instanceMatrix.needsUpdate = true;
+
+    // Car - physics (raycast vehicle)
+    const chassisShape = new CANNON.Box(new CANNON.Vec3(0.6, 0.25, 1.1));
+    const chassisBody = new CANNON.Body({ mass: 550, shape: chassisShape, position: new CANNON.Vec3(0, 10, 0) });
+    chassisBody.angularDamping = 0.3;
+    world.addBody(chassisBody);
+
+    const vehicle = new CANNON.RaycastVehicle({ chassisBody, indexRightAxis: 0, indexUpAxis: 1, indexForwardAxis: 2 });
+    const wheelOptions = {
+      radius: 0.38,
+      directionLocal: new CANNON.Vec3(0, -1, 0),
+      suspensionStiffness: 28,
+      suspensionRestLength: 0.35,
+      frictionSlip: 2.2,
+      dampingRelaxation: 2.3,
+      dampingCompression: 4.4,
+      maxSuspensionForce: 120000,
+      rollInfluence: 0.04,
+      axleLocal: new CANNON.Vec3(-1, 0, 0),
+      chassisConnectionPointLocal: new CANNON.Vec3(1, 1, 0),
+      maxSuspensionTravel: 0.35,
+      customSlidingRotationalSpeed: -30,
+      useCustomSlidingRotationalSpeed: true
+    };
+    const axleZ = 0.85; // half-length
+    const axleX = 0.62; // half-width
+    // FL, FR, RL, RR
+    vehicle.addWheel({ ...wheelOptions, chassisConnectionPointLocal: new CANNON.Vec3(-axleX, -0.15, axleZ) });
+    vehicle.addWheel({ ...wheelOptions, chassisConnectionPointLocal: new CANNON.Vec3( axleX, -0.15, axleZ) });
+    vehicle.addWheel({ ...wheelOptions, chassisConnectionPointLocal: new CANNON.Vec3(-axleX, -0.15,-axleZ) });
+    vehicle.addWheel({ ...wheelOptions, chassisConnectionPointLocal: new CANNON.Vec3( axleX, -0.15,-axleZ) });
+    vehicle.addToWorld(world);
+
+    // RaycastVehicle does not require separate dynamic wheel bodies
+
+    // Visuals for car
+    const carGroup = new THREE.Group();
+    scene.add(carGroup);
+    // Chassis visual: stylized rally hatchback
+    const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2e7bd8, metalness: 0.1, roughness: 0.8 });
+    const glassMat = new THREE.MeshStandardMaterial({ color: 0x99b6d9, metalness: 0.0, roughness: 0.05, transparent: true, opacity: 0.6 });
+    const blackMat = new THREE.MeshStandardMaterial({ color: 0x222222, metalness: 0.0, roughness: 0.9 });
+    const wheelMatMesh = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 1.0 });
+
+    const chassisMesh = new THREE.Group();
+    const lower = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.4, 2.0), bodyMat);
+    lower.position.y = 0.2;
+    chassisMesh.add(lower);
+    const upper = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.36, 1.2), bodyMat);
+    upper.position.set(0, 0.58, -0.1);
+    chassisMesh.add(upper);
+    const hood = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.25, 0.6), bodyMat);
+    hood.position.set(0, 0.5, 0.7);
+    chassisMesh.add(hood);
+    const spoiler = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.06, 0.4), blackMat);
+    spoiler.position.set(0, 0.78, -1.0);
+    chassisMesh.add(spoiler);
+    const windshield = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.26, 0.02), glassMat);
+    windshield.position.set(0, 0.68, 0.15);
+    windshield.rotation.x = -0.4;
+    chassisMesh.add(windshield);
+    const rearGlass = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.24, 0.02), glassMat);
+    rearGlass.position.set(0, 0.64, -0.6);
+    rearGlass.rotation.x = 0.4;
+    chassisMesh.add(rearGlass);
+
+    // Wheels
+    const wheelGeo = new THREE.CylinderGeometry(0.38, 0.38, 0.28, 20);
+    wheelGeo.rotateZ(Math.PI/2);
+    const wheels = [0,1,2,3].map(() => new THREE.Mesh(wheelGeo, wheelMatMesh));
+    wheels.forEach(w => { w.castShadow = false; carGroup.add(w); });
+
+    carGroup.add(chassisMesh);
+
+    // Helpers
+    function syncVisuals() {
+      // Chassis
+      chassisMesh.position.copy(chassisBody.position);
+      chassisMesh.quaternion.copy(chassisBody.quaternion);
+      // Wheels
+      for (let i = 0; i < vehicle.wheelInfos.length; i++) {
+        vehicle.updateWheelTransform(i);
+        const t = vehicle.wheelInfos[i].worldTransform;
+        wheels[i].position.set(t.position.x, t.position.y, t.position.z);
+        wheels[i].quaternion.set(t.quaternion.x, t.quaternion.y, t.quaternion.z, t.quaternion.w);
+      }
+    }
+
+    // Controls
+    const keys = { forward:false, back:false, left:false, right:false, brake:false };
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat) return;
+      switch (e.code) {
+        case 'KeyW': case 'ArrowUp': keys.forward = true; break;
+        case 'KeyS': case 'ArrowDown': keys.back = true; break;
+        case 'KeyA': case 'ArrowLeft': keys.left = true; break;
+        case 'KeyD': case 'ArrowRight': keys.right = true; break;
+        case 'Space': keys.brake = true; break;
+        case 'KeyR': resetCar(); break;
+        case 'KeyT': treesGroup.visible = !treesGroup.visible; break;
+        case 'KeyY': rocksGroup.visible = !rocksGroup.visible; break;
+      }
+    });
+    window.addEventListener('keyup', (e) => {
+      switch (e.code) {
+        case 'KeyW': case 'ArrowUp': keys.forward = false; break;
+        case 'KeyS': case 'ArrowDown': keys.back = false; break;
+        case 'KeyA': case 'ArrowLeft': keys.left = false; break;
+        case 'KeyD': case 'ArrowRight': keys.right = false; break;
+        case 'Space': keys.brake = false; break;
+      }
+    });
+
+    function resetCar() {
+      chassisBody.position.set(0, 12, 0);
+      chassisBody.velocity.setZero();
+      chassisBody.angularVelocity.setZero();
+      chassisBody.quaternion.setFromEuler(0, 0, 0);
+    }
+
+    const maxEngineForce = 2400;
+    const maxBrakeForce = 42;
+    const steeringClamp = 0.42;
+
+    function updateControls() {
+      const engine = (keys.forward ? -maxEngineForce : 0) + (keys.back ? maxEngineForce : 0);
+      const steer = (keys.left ? 1 : 0) + (keys.right ? -1 : 0);
+      const steering = steeringClamp * steer;
+
+      for (let i = 0; i < 4; i++) {
+        vehicle.setBrake(0, i);
+        vehicle.applyEngineForce(0, i);
+      }
+      // Front wheels steer (0,1)
+      vehicle.setSteeringValue(steering, 0);
+      vehicle.setSteeringValue(steering, 1);
+      // Rear-wheel drive
+      vehicle.applyEngineForce(engine, 2);
+      vehicle.applyEngineForce(engine, 3);
+      if (keys.brake) {
+        vehicle.setBrake(maxBrakeForce, 2);
+        vehicle.setBrake(maxBrakeForce, 3);
+      }
+    }
+
+    // Camera follow
+    const camTarget = new THREE.Vector3();
+    const camLook = new THREE.Vector3();
+    function updateCamera(dt) {
+      const chassisPos = chassisBody.position;
+      const chassisQuat = chassisBody.quaternion;
+      // Desired camera offset behind car
+      const back = new CANNON.Vec3(0, 1.5, -5.5);
+      const qv = chassisQuat.vmult(back);
+      camTarget.set(chassisPos.x + qv.x, chassisPos.y + qv.y, chassisPos.z + qv.z);
+      // Smooth follow
+      camera.position.lerp(camTarget, 1 - Math.pow(0.0001, dt));
+      // Look at a point ahead of the car
+      const ahead = new CANNON.Vec3(0, 0.8, 2.5);
+      const qa = chassisQuat.vmult(ahead);
+      camLook.set(chassisPos.x + qa.x, chassisPos.y + qa.y, chassisPos.z + qa.z);
+      camera.lookAt(camLook);
+    }
+
+    // Utility: sample terrain normal at world x,z (approx)
+    function sampleNormalAt(x, z) {
+      const i = THREE.MathUtils.clamp(Math.round((x + TERRAIN_SIZE/2) / ELEMENT_SIZE), 1, RES-1);
+      const j = THREE.MathUtils.clamp(Math.round((-z + TERRAIN_SIZE/2) / ELEMENT_SIZE), 1, RES-1);
+      const hL = heightData[j][i-1];
+      const hR = heightData[j][i+1];
+      const hD = heightData[j-1][i];
+      const hU = heightData[j+1][i];
+      const normal = new THREE.Vector3(hL - hR, 2.0, hD - hU).normalize();
+      return normal;
+    }
+
+    // Ground decals/tracks would be expensive; skip for low-end performance
+
+    // Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    });
+
+    // Simulation loop
+    const fixedTimeStep = 1/60;
+    let lastTime = performance.now();
+    let acc = 0;
+    let lastFpsT = 0; let frames = 0; let fps = 0;
+
+    function animate() {
+      const now = performance.now();
+      const dt = (now - lastTime) / 1000;
+      lastTime = now;
+      acc += dt;
+
+      updateControls();
+      const substeps = 2; // for stability
+      const step = fixedTimeStep / substeps;
+      for (let s = 0; s < substeps; s++) world.step(step);
+      syncVisuals();
+      updateCamera(dt);
+
+      renderer.render(scene, camera);
+
+      // PERF HUD
+      frames++;
+      if (now - lastFpsT > 500) {
+        fps = Math.round(frames * 1000 / (now - lastFpsT));
+        frames = 0; lastFpsT = now;
+        perfEl.textContent = `fps: ${fps} | bodies: ${world.bodies.length}`;
+      }
+      requestAnimationFrame(animate);
+    }
+
+    // Start
+    resetCar();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
